@@ -1,17 +1,204 @@
-# one_gym_app
+# 🏋️ One Gym App — Lean MVP
 
-A new Flutter project.
+> Мобільний додаток для одного преміального фітнес-залу (Україна).  
+> Соло-проєкт. Flutter + Supabase (Smart DB). Без кастомного бекенду.
 
-## Getting Started
+---
 
-This project is a starting point for a Flutter application.
+## 📌 Контекст для Cursor / AI-асистентів
 
-A few resources to get you started if this is your first Flutter project:
+Це **не SaaS**. Один зал — одна локація. Вся бізнес-логіка зосереджена в **PostgreSQL** (тригери, RPC, pg_cron). Кастомного Node.js/Python бекенду **немає і не буде** в MVP. Flutter-клієнт спілкується напряму з Supabase.
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+---
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+## 🎯 Мета MVP
+
+- Спростити бронювання тренувань для клієнтів
+- Автоматизувати push-нагадування через `pg_cron` (без стороннього бекенду)
+- Зняти навантаження з адміністратора
+- Підвищити утримання клієнтів
+
+---
+
+## 🛠 Технологічний стек
+
+| Шар | Технологія |
+|---|---|
+| Mobile (iOS + Android) | Flutter |
+| State Management | Riverpod 2.0 (з кодогенерацією) |
+| Routing | GoRouter / AutoRoute (Role-Based) |
+| Backend / DB | Supabase (PostgreSQL) |
+| Auth | Supabase Auth |
+| Security | Row Level Security (RLS) |
+| Push-нотифікації | Firebase Cloud Messaging (FCM) |
+| Автоматизація БД | `pg_cron` + тригери + RPC (Stored Procedures) |
+| Валюта | UAH |
+| Локалізація UI | Ukrainian (UA) / Russian (RU) |
+
+---
+
+## 👥 Ролі користувачів
+
+### `client` — Клієнт
+- Переглядає статус і залишок абонементу
+- Бронює / скасовує тренування
+- Переглядає історію відвідувань
+- Отримує push-нотифікації автоматично
+
+### `trainer` — Тренер
+- Переглядає своє розклад (read-only)
+- Бачить список записаних клієнтів та їх статуси (`checked-in` / `not arrived`)
+- **Не** виконує Check-in
+
+### `admin` — Адміністратор
+- **Немає UI в мобільному додатку**
+- Працює через **Supabase Studio** (Web)
+- Виконує Check-in та генерацію розкладу через SQL-виклики (RPC)
+
+### `reviewer` — Apple / Google Reviewer
+- Сидований тестовий акаунт (`is_test_account = true`)
+- Вічний абонемент для проходження модерації в сторах
+
+---
+
+## 🗄 Структура бази даних
+
+```
+profiles          — дані користувачів, settings JSONB (тема, локаль)
+roles             — ролі: client | trainer | admin | reviewer
+subscriptions     — абонементи: тип, дата закінчення, залишок відвідувань
+payments          — платежі (офлайн в MVP)
+trainers          — профілі тренерів
+training_types    — типи тренувань
+schedule_slots    — розклад (час зберігається в UTC)
+bookings          — бронювання (стейт-машина статусів)
+user_devices      — FCM токени пристроїв
+```
+
+### Ключові архітектурні рішення БД
+
+- **`settings JSONB`** у `profiles` — зберігання UI-налаштувань без SQL-міграцій
+- **Soft Delete** — при видаленні акаунту: запис в Supabase Auth видаляється, ПДН затираються, в `payments` / `bookings` ID замінюється на `deleted_user` (GDPR + Apple Compliance)
+- **Тригери** — вся бізнес-логіка списання/повернення відвідувань живе в БД
+- **RPC (Stored Procedures)** — для адмінських дій: Check-in, генерація розкладу
+
+---
+
+## 📦 Модулі MVP (строго 5)
+
+### Модуль 1 — Авторизація
+- Email / Phone login через Supabase Auth
+- Ролі визначаються з таблиці `roles`
+- FCM токен зберігається і оновлюється в `user_devices`
+- Role-Based роутинг: додаток сам визначає стартовий екран після логіну
+
+### Модуль 2 — Абонементи
+- Клієнт бачить: тип, дату закінчення, залишок відвідувань
+- Типи: по кількості, по терміну, комбінований
+- **На рівні БД**: неможливо забронювати при прострочені або перевищенні ліміту
+
+### Модуль 3 — Розклад
+- Час зберігається строго в **UTC**
+- Поля слоту: тип тренування, тренер, час, ліміт місць
+- SQL-функція масової генерації розкладу (викликається адміном через RPC)
+
+### Модуль 4 — Бронювання (State Machine)
+Статуси бронювання (строга стейт-машина в БД):
+```
+booked → attended           (Check-in адміном)
+booked → cancelled_by_client (скасування клієнтом вчасно)
+booked → cancelled_by_club   (скасування клубом → автоповернення відвідування)
+```
+- Всі перевірки (ліміти, подвійне бронювання) — через DB Triggers
+- Атомарна SQL-транзакція при бронюванні
+
+### Модуль 5 — Push-нотифікації
+- Повністю автоматизовано через `pg_cron`
+- **«За 2 години до тренування»** — нагадування клієнту
+- **«За 3 дні до закінчення абонементу»** — нагадування клієнту
+- БД сама дергає вебхук FCM без стороннього бекенду
+
+---
+
+## ⚙️ Бізнес-правила (критичні транзакції)
+
+| Сценарій | Логіка |
+|---|---|
+| Бронювання | Активний абонемент + вільні місця + немає перетину по часу → атомарна транзакція |
+| Скасування (вчасно) | За X годин до початку → `cancelled_by_client`, відвідування повертається |
+| Скасування (пізно / no-show) | Відвідування **списується** |
+| Скасування клубом | `cancelled_by_club` → тригер автоматично повертає відвідування |
+| Check-in | Тільки адмін → статус → `attended` |
+
+---
+
+## 🛤 Ітеративний план розробки
+
+```
+Етап 1: Smart DB — схеми, RLS, JSONB, тригери, RPC
+Етап 2: Supabase Auth + Riverpod + Role-Based роутинг
+Етап 3: UI та логіка модуля Розкладу
+Етап 4: Модуль Бронювання (UI ↔ стейт-машина БД)
+Етап 5: Модуль Абонементів (відображення лімітів)
+Етап 6: FCM + pg_cron (Push-нотифікації)
+```
+
+---
+
+## 🚫 Анти-Scope Creep (поза MVP)
+
+- ❌ Без турнікетів / QR / TOTP
+- ❌ Без офлайн-режиму (кешується тільки токен авторизації)
+- ❌ Без платіжного шлюзу (оплата офлайн або через адміна)
+- ❌ Без кастомної веб-адмінки (тільки Supabase Studio)
+- ❌ Без AI, Health Sync, трекінгу харчування
+- ❌ Без SaaS / мультилокацій
+
+---
+
+## ✅ Definition of Done
+
+MVP вважається готовим, коли:
+
+- [ ] Клієнт може зареєструватися / увійти (включно з reviewer-акаунтом)
+- [ ] Клієнт бачить актуальний статус абонементу
+- [ ] Клієнт може забронювати / скасувати тренування (БД коректно списує/повертає відвідування без багів при конкурентному записі)
+- [ ] Клієнт отримує push-нагадування автоматично через `pg_cron`
+- [ ] Тренер може переглянути список записаних клієнтів (read-only)
+- [ ] Адмін може згенерувати розклад і виконати Check-in через SQL-виклик у Supabase Studio
+
+---
+
+## 🚀 Фаза 2 (Post-MVP)
+
+Додається тільки після стабілізації ядра:
+
+- **Офлайн + Турнікети**: TOTP / динамічний QR-код (локальна БД Isar)
+- **Онлайн-оплати**: WayForPay, Mono через Supabase Edge Functions (Deno)
+- **Галерея прогресу**: завантаження "До/Після" через Supabase Storage
+- **AI & Health**: AI Nutrition, Apple HealthKit / Google Health Connect
+
+---
+
+## 📁 Структура проєкту (Flutter)
+
+```
+lib/
+├── core/
+│   ├── router/          # GoRouter + Role-Based routing
+│   ├── permissions/     # Permission Manager (FCM)
+│   └── supabase/        # Supabase client init
+├── features/
+│   ├── auth/            # Модуль 1: Авторизація
+│   ├── subscriptions/   # Модуль 2: Абонементи
+│   ├── schedule/        # Модуль 3: Розклад
+│   ├── bookings/        # Модуль 4: Бронювання
+│   └── notifications/   # Модуль 5: Push
+└── shared/
+    ├── providers/       # Riverpod providers
+    └── widgets/         # Спільні UI компоненти
+```
+
+---
+
+*Соло-проєкт. Foundation Edition. Масштабується після стабілізації ядра.*
