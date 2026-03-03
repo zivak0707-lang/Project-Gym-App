@@ -1,0 +1,383 @@
+---
+description: One Gym App — правила для Cursor AI
+globs: ["**/*.dart", "**/*.yaml", "**/*.sql", "**/*.json"]
+alwaysApply: true
+---
+
+# ONE GYM APP — Cursor AI Master Rules
+
+## ПЕРШ НІЖ ПИСАТИ КОД
+
+Ти — senior Flutter розробник який розуміє архітектуру цього проекту.
+Перед кожним завданням:
+1. Зрозумій ЧОГО хоче досягти код (логіка, UX)
+2. Перевір чи не порушується бізнес-логіка БД
+3. Переконайся що структура файлів відповідає проекту
+4. Генеруй тільки те що потрібно — не більше
+
+КРИТИЧНЕ ПРАВИЛО: Вся бізнес-логіка живе в PostgreSQL (тригери, RPC).
+Flutter — це тільки UI + виклики RPC. Ніколи не дублюй логіку БД у Dart.
+
+---
+
+## СТЕК І ВЕРСІЇ
+
+Flutter: 3.41.2 / Dart SDK: ^3.11.0
+supabase_flutter: ^2.8.4
+firebase_core: ^3.13.0 / firebase_messaging: ^15.2.5
+flutter_riverpod: ^2.6.1 + riverpod_annotation: ^2.4.1
+go_router: ^14.6.2
+riverpod_generator: ^2.6.3 + build_runner: ^2.4.15
+custom_lint: ^0.7.5 + riverpod_lint: ^2.6.3
+shared_preferences: ^2.3.5 + intl: ^0.19.0
+
+Supabase URL: https://jlihxryvezbtkolxyvza.supabase.co
+
+---
+
+## РОЛІ КОРИСТУВАЧІВ
+
+client   -> свої дані, бронювання, абонемент -> Мобільний додаток
+trainer  -> свої слоти + список клієнтів (READ ONLY) -> Мобільний додаток
+admin    -> тільки Supabase Studio, НЕ мобільний додаток
+reviewer -> is_test_account=true, вічний абонемент -> Мобільний додаток
+
+ВАЖЛИВО: Адмін НЕ має UI в мобільному додатку. Ніколи не створюй екрани для admin.
+
+---
+
+## СТРУКТУРА ФАЙЛІВ (обов'язкова)
+
+lib/
+├── core/
+│   ├── supabase/supabase_config.dart
+│   ├── router/app_router.dart + route_names.dart
+│   └── theme/app_theme.dart
+├── features/
+│   ├── auth/
+│   │   ├── data/auth_repository.dart
+│   │   ├── domain/auth_state.dart
+│   │   └── presentation/providers/auth_provider.dart
+│   │                    screens/login_screen.dart
+│   ├── subscriptions/
+│   │   ├── data/subscription_repository.dart
+│   │   └── presentation/providers/subscription_provider.dart
+│   │                    screens/subscription_screen.dart
+│   ├── schedule/
+│   │   ├── data/schedule_repository.dart
+│   │   └── presentation/providers/schedule_provider.dart
+│   │                    screens/schedule_screen.dart + slot_detail_screen.dart
+│   ├── bookings/
+│   │   ├── data/booking_repository.dart
+│   │   └── presentation/providers/booking_provider.dart
+│   │                    screens/booking_history_screen.dart
+│   └── notifications/fcm_service.dart
+└── shared/
+    ├── models/profile.dart + subscription.dart + schedule_slot.dart
+    │          booking.dart + trainer.dart
+    └── widgets/loading_widget.dart + error_widget.dart
+
+Правило: один клас = один файл. Назви файлів: snake_case.dart
+
+---
+
+## ТАБЛИЦІ БД
+
+profiles         - id, full_name, phone, role, avatar_url, settings JSONB,
+                   is_deleted, is_test_account
+subscriptions    - client_id, plan_id, visits_left, valid_from,
+                   valid_until, is_active
+subscription_plans - name_uk, name_ru, visit_limit, duration_days,
+                     price_uah, sub_type
+payments         - client_id, subscription_id, amount_uah, method, paid_at
+trainers         - profile_id, bio_uk, bio_ru, specialization, photo_url
+training_types   - name_uk, name_ru, description_uk, color_hex, icon_name
+schedule_slots   - training_type_id, trainer_id, starts_at(UTC), ends_at(UTC),
+                   capacity, booked_count, waitlist_limit, is_cancelled
+bookings         - client_id, slot_id, subscription_id, status,
+                   cancelled_at, checked_in_at
+waitlist         - client_id, slot_id, subscription_id, position,
+                   status, promoted_at, expires_at
+user_devices     - profile_id, fcm_token, platform, app_version
+notification_log - profile_id, type, reference_id, sent_at
+gym_config       - cancellation_hours, waitlist_confirm_minutes,
+                   timezone, fcm_webhook_url
+
+ЗАБОРОНЕНО: Прямий INSERT/UPDATE/DELETE у bookings, subscriptions, waitlist — тільки RPC!
+
+---
+
+## RPC ФУНКЦІЇ — ПОВНИЙ СПИСОК
+
+### Клієнтські (викликає Flutter)
+
+// Створити бронювання
+// Помилки: UNAUTHORIZED, SLOT_CANCELLED, SLOT_IN_PAST, NO_SEATS,
+//          SUB_NOT_FOUND, SUB_INACTIVE, SUB_EXPIRED, NO_VISITS_LEFT,
+//          TIME_CONFLICT, ALREADY_BOOKED
+await supabase.rpc('rpc_create_booking', params: {
+  'p_slot_id': slotId,        // UUID String
+  'p_subscription_id': subId, // UUID String
+});
+
+// Скасувати бронювання
+// Помилки: NOT_FOUND, WRONG_STATUS, TRAINING_ALREADY_STARTED
+// Повертає: {success, visits_refunded, cancellation_hours, message_uk}
+await supabase.rpc('rpc_cancel_booking', params: {
+  'p_booking_id': bookingId,
+});
+
+// Стати в чергу
+// Повертає: {success, waitlist_id, position}
+await supabase.rpc('rpc_join_waitlist', params: {
+  'p_slot_id': slotId,
+  'p_subscription_id': subId,
+});
+
+// Вийти з черги
+await supabase.rpc('rpc_leave_waitlist', params: {
+  'p_waitlist_id': waitlistId,
+});
+
+// Підтвердити просування з черги
+// Помилки: NOT_FOUND, NOT_PROMOTED, OFFER_EXPIRED
+await supabase.rpc('rpc_confirm_waitlist_promotion', params: {
+  'p_waitlist_id': waitlistId,
+});
+
+// Зареєструвати FCM токен (викликати при кожному логіні)
+await supabase.rpc('rpc_upsert_device_token', params: {
+  'p_fcm_token': token,
+  'p_platform': 'android', // або 'ios'
+  'p_app_version': '1.0.0',
+});
+
+### Адмінські — НЕ ВИКЛИКАТИ З FLUTTER (тільки Supabase Studio)
+
+rpc_assign_subscription(p_client_id, p_plan_id, p_notes?, p_payment_method?, p_amount_uah?)
+rpc_checkin_booking(p_booking_id, p_admin_id)
+rpc_cancel_slot(p_slot_id, p_reason?)
+rpc_generate_schedule(p_training_type_id, p_trainer_id, p_start_date,
+                      p_days_count, p_start_time, p_duration_minutes,
+                      p_capacity, p_weekdays int[], p_waitlist_limit?)
+rpc_search_client(p_query)
+rpc_delete_client(p_client_id)
+rpc_setup_test_account(p_client_id)
+
+---
+
+## СТАТУСИ БРОНЮВАНЬ (State Machine)
+
+booked -> attended           (check-in адміном)
+booked -> cancelled_by_client (візит повертається якщо > cancellation_hours)
+booked -> cancelled_by_club   (візит ЗАВЖДИ повертається — тригер БД)
+booked -> no_show             (місце звільняється, візит НЕ повертається)
+
+Flutter тільки читає статус. Змінює тільки через RPC.
+
+---
+
+## RIVERPOD — ОБОВ'ЯЗКОВІ ПРАВИЛА
+
+// ПРАВИЛЬНО — кодогенерація
+@riverpod
+Future<List<ScheduleSlot>> scheduleSlots(ScheduleSlotsRef ref) async {
+  return ref.watch(scheduleRepositoryProvider).getSlots();
+}
+
+@riverpod
+class BookingNotifier extends _$BookingNotifier {
+  @override
+  AsyncValue<void> build() => const AsyncData(null);
+
+  Future<void> createBooking(String slotId, String subId) async {
+    state = const AsyncLoading();
+    state = await AsyncValue.guard(() =>
+      ref.read(bookingRepositoryProvider).createBooking(slotId, subId)
+    );
+  }
+}
+
+// ЗАБОРОНЕНО — ручне створення без анотацій
+final myProvider = StateNotifierProvider<MyNotifier, MyState>(...); // НЕ РОБИТИ
+
+// Після змін провайдерів ЗАВЖДИ запускати:
+// dart run build_runner build --delete-conflicting-outputs
+
+---
+
+## РОУТИНГ (GoRouter)
+
+Redirect після логіну:
+- client  -> /schedule
+- trainer -> /trainer/schedule
+- admin   -> /schedule (немає свого UI)
+- null    -> /login
+
+Константи маршрутів (тільки з RouteNames):
+login = '/login'
+schedule = '/schedule'
+slotDetail = '/schedule/:slotId'
+bookingHistory = '/bookings'
+subscription = '/subscription'
+trainerSchedule = '/trainer/schedule'
+profile = '/profile'
+
+---
+
+## РОБОТА З ЧАСОМ — КРИТИЧНО
+
+БД зберігає час в UTC. Конвертуй для відображення:
+
+// ПРАВИЛЬНО
+final localTime = slot.startsAt.toLocal();
+final formatted = DateFormat('dd.MM HH:mm').format(localTime);
+
+// НЕПРАВИЛЬНО
+Text(slot.startsAt.toString()) // показує UTC — НЕ РОБИТИ
+
+// При парсингу з Supabase:
+DateTime.parse(json['starts_at'] as String).toUtc()
+
+---
+
+## ШАБЛОН МОДЕЛІ
+
+class ScheduleSlot {
+  final String id;
+  final String trainingTypeId;
+  final String? trainerId;
+  final DateTime startsAt;  // завжди UTC
+  final DateTime endsAt;    // завжди UTC
+  final int capacity;
+  final int bookedCount;
+  final int waitlistLimit;
+  final bool isCancelled;
+
+  factory ScheduleSlot.fromJson(Map<String, dynamic> json) => ScheduleSlot(
+    id: json['id'] as String,
+    trainingTypeId: json['training_type_id'] as String,
+    trainerId: json['trainer_id'] as String?,
+    startsAt: DateTime.parse(json['starts_at'] as String).toUtc(),
+    endsAt: DateTime.parse(json['ends_at'] as String).toUtc(),
+    capacity: json['capacity'] as int,
+    bookedCount: json['booked_count'] as int,
+    waitlistLimit: json['waitlist_limit'] as int,
+    isCancelled: json['is_cancelled'] as bool,
+  );
+
+  bool get isFull => bookedCount >= capacity;
+  int get seatsLeft => capacity - bookedCount;
+  DateTime get startsAtLocal => startsAt.toLocal();
+}
+
+---
+
+## ШАБЛОН ОБРОБКИ ПОМИЛОК RPC
+
+Future<void> createBooking(String slotId, String subId) async {
+  try {
+    final result = await supabase.rpc('rpc_create_booking', params: {
+      'p_slot_id': slotId,
+      'p_subscription_id': subId,
+    });
+    if (result['success'] == true) {
+      // успіх — result['booking_id']
+    } else {
+      throw AppException(_mapRpcError(result['error'] as String));
+    }
+  } on PostgrestException catch (e) {
+    throw AppException('DB error: ${e.message}');
+  }
+}
+
+String _mapRpcError(String code) => switch (code) {
+  'NO_SEATS'        => 'Місць немає. Записатись в чергу?',
+  'SUB_EXPIRED'     => 'Абонемент закінчився',
+  'SUB_INACTIVE'    => 'Абонемент не активний',
+  'NO_VISITS_LEFT'  => 'Закінчились відвідування',
+  'TIME_CONFLICT'   => 'У вас вже є тренування в цей час',
+  'SLOT_IN_PAST'    => 'Це тренування вже відбулось',
+  'SLOT_CANCELLED'  => 'Тренування скасовано клубом',
+  'ALREADY_BOOKED'  => 'Ви вже записані на це тренування',
+  _                 => 'Щось пішло не так. Спробуйте ще раз',
+};
+
+---
+
+## FCM ШАБЛОН
+
+class FcmService {
+  static Future<void> init() async {
+    final settings = await FirebaseMessaging.instance.requestPermission();
+    if (settings.authorizationStatus != AuthorizationStatus.authorized) return;
+    final token = await FirebaseMessaging.instance.getToken();
+    if (token != null) await _saveToken(token);
+    FirebaseMessaging.instance.onTokenRefresh.listen(_saveToken);
+  }
+
+  static Future<void> _saveToken(String token) async {
+    await supabase.rpc('rpc_upsert_device_token', params: {
+      'p_fcm_token': token,
+      'p_platform': Platform.isIOS ? 'ios' : 'android',
+      'p_app_version': '1.0.0',
+    });
+  }
+}
+
+Типи нотифікацій з pg_cron:
+reminder_2h, reminder_1h, subscription_expiry_3d, subscription_expiry_1d,
+booking_confirmed, booking_cancelled_club, waitlist_promoted
+
+---
+
+## ЛОКАЛІЗАЦІЯ
+
+Мова в profiles.settings JSONB: {"locale": "uk"} або {"locale": "ru"}
+Поля БД: name_uk / name_ru, description_uk / description_ru
+
+String getLocalName(String? uk, String? ru, String locale) =>
+  locale == 'ru' ? (ru ?? uk ?? '') : (uk ?? '');
+
+---
+
+## ЧЕРВОНІ ЛІНІЇ — ЗАБОРОНЕНО
+
+- Бізнес-логіка у Dart (перевірки лімітів, розрахунки балансу)
+- Прямий INSERT у bookings — тільки rpc_create_booking
+- Прямий UPDATE subscriptions.visits_left — тільки тригери БД
+- Прямий DELETE з bookings — тільки rpc_cancel_booking
+- setState() — тільки Riverpod
+- Navigator.push() — тільки GoRouter
+- Провайдери без @riverpod анотацій
+- Зберігати JWT/паролі в SharedPreferences
+- Хардкодити рядки UI без локалізації
+- Будь-який UI для ролі admin
+- Вимикати або обходити RLS Supabase
+- Дублювати логіку тригерів БД у Dart
+
+---
+
+## MVP — ТІЛЬКИ 5 МОДУЛІВ
+
+Модуль 1: Авторизація  — email/phone login, role-based redirect, FCM токен
+Модуль 2: Абонементи  — статус, visits_left, valid_until
+Модуль 3: Розклад     — список слотів, деталі тренування
+Модуль 4: Бронювання  — create/cancel через RPC, відображення статусів
+Модуль 5: Push        — FCM токен при логіні, обробка вхідних нотифікацій
+
+Поза MVP (не реалізовувати зараз):
+онлайн-оплати, QR/TOTP, офлайн-режим, AI, Health Sync, фото, веб-адмінка
+
+---
+
+## ЧЕКЛІСТ ПЕРЕД ЗАВЕРШЕННЯМ ЗАВДАННЯ
+
+[ ] Бізнес-логіка не продубльована у Dart?
+[ ] Структура папок відповідає проекту?
+[ ] Використані @riverpod анотації?
+[ ] Всі помилки RPC оброблені?
+[ ] UTC час конвертується в local для UI?
+[ ] Немає UI для admin ролі?
+[ ] RLS Supabase не порушується?
+[ ] build_runner запущений після змін провайдерів?
